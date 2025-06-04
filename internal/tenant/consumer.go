@@ -10,7 +10,6 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
-// TenantConsumer handles consuming messages from RabbitMQ and storing them in PostgreSQL.
 type TenantConsumer struct {
 	tenantID   uuid.UUID
 	queueName  string

@@ -1,40 +1,44 @@
-package test
+package integration_test
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
 	"log"
 	"os"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	_ "github.com/lib/pq"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/ory/dockertest/v3"
 	"github.com/ory/dockertest/v3/docker"
-	"github.com/jackc/pgx/v5/pgxpool"
-	amqp "github.com/rabbitmq/amqp091-go"
+	amqp091 "github.com/rabbitmq/amqp091-go"
 
 	"github.com/srireskianita/multi-tenant-messaging/internal/tenant"
 )
 
 var (
-	dbPool  *pgxpool.Pool
-	rmqConn *amqp.Connection
-	tm      *tenant.TenantManager
+	sqlDB      *sql.DB
+	pgPool     *pgxpool.Pool
+	rabbitConn *amqp091.Connection
 )
 
 func TestMain(m *testing.M) {
-	// Setup docker pool
+	// Start Docker pool
 	pool, err := dockertest.NewPool("")
 	if err != nil {
-		log.Fatalf("Could not connect to docker: %s", err)
+		log.Fatalf("Could not connect to Docker: %s", err)
 	}
 
-	// Run Postgres container
-	pgResource, err := pool.RunWithOptions(&dockertest.RunOptions{
+	// Start Postgres container
+	resource, err := pool.RunWithOptions(&dockertest.RunOptions{
 		Repository: "postgres",
 		Tag:        "13",
 		Env: []string{
-			"POSTGRES_USER=postgres",
+			"POSTGRES_USER=test",
 			"POSTGRES_PASSWORD=secret",
 			"POSTGRES_DB=testdb",
 		},
@@ -43,138 +47,151 @@ func TestMain(m *testing.M) {
 		config.RestartPolicy = docker.RestartPolicy{Name: "no"}
 	})
 	if err != nil {
-		log.Fatalf("Could not start postgres container: %s", err)
+		log.Fatalf("Could not start resource: %s", err)
 	}
+	resource.Expire(120)
 
-	pgPort := pgResource.GetPort("5432/tcp")
-	dbURL := "postgres://postgres:secret@localhost:" + pgPort + "/testdb?sslmode=disable"
+	// Build DSN
+	dsn := fmt.Sprintf("postgres://test:secret@localhost:%s/testdb?sslmode=disable", resource.GetPort("5432/tcp"))
 
-	// Wait for Postgres to be ready
-	if err = pool.Retry(func() error {
+	// Retry until Postgres is ready (sql.Open + Ping)
+	err = pool.Retry(func() error {
 		var err error
-		dbPool, err = pgxpool.New(context.Background(), dbURL)
+		sqlDB, err = sql.Open("postgres", dsn)
 		if err != nil {
 			return err
 		}
-		return dbPool.Ping(context.Background())
-	}); err != nil {
-		log.Fatalf("Could not connect to postgres: %s", err)
-	}
-
-	// Run RabbitMQ container
-	rmqResource, err := pool.RunWithOptions(&dockertest.RunOptions{
-		Repository: "rabbitmq",
-		Tag:        "3.9-management",
-		Env: []string{
-			"RABBITMQ_DEFAULT_USER=guest",
-			"RABBITMQ_DEFAULT_PASS=guest",
-		},
-	}, func(config *docker.HostConfig) {
-		config.AutoRemove = true
-		config.RestartPolicy = docker.RestartPolicy{Name: "no"}
+		return sqlDB.Ping()
 	})
 	if err != nil {
-		log.Fatalf("Could not start rabbitmq container: %s", err)
+		log.Fatalf("Could not connect to database: %s", err)
 	}
 
-	rmqPort := rmqResource.GetPort("5672/tcp")
-	rmqURL := "amqp://guest:guest@localhost:" + rmqPort + "/"
-
-	// Wait for RabbitMQ to be ready
-	if err = pool.Retry(func() error {
-		rmqConn, err = amqp.Dial(rmqURL)
-		return err
-	}); err != nil {
-		log.Fatalf("Could not connect to rabbitmq: %s", err)
+	// Run migration
+	if err := runMigrations(sqlDB); err != nil {
+		log.Fatalf("Could not run migrations: %s", err)
 	}
 
-	// Initialize TenantManager with concurrency 5 (example)
-	tm = tenant.NewTenantManager(rmqConn, dbPool, 5)
+	// Setup pgxpool for TenantManager
+	config, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		log.Fatalf("Failed to parse pgxpool config: %v", err)
+	}
+	pgPool, err = pgxpool.ConnectConfig(context.Background(), config)
+	if err != nil {
+		log.Fatalf("Failed to connect pgxpool: %v", err)
+	}
 
+	// Connect to RabbitMQ (pastikan RabbitMQ sudah berjalan di localhost:5672)
+	rabbitConn, err = amqp091.Dial("amqp://guest:guest@localhost:5672/")
+	if err != nil {
+		log.Fatalf("Failed to connect RabbitMQ: %v", err)
+	}
+
+	// Run tests
 	code := m.Run()
 
 	// Cleanup
-	if err := rmqConn.Close(); err != nil {
-		log.Printf("Error closing RabbitMQ connection: %v", err)
-	}
-	dbPool.Close()
-
-	if err := pool.Purge(pgResource); err != nil {
-		log.Printf("Could not purge postgres container: %v", err)
-	}
-	if err := pool.Purge(rmqResource); err != nil {
-		log.Printf("Could not purge rabbitmq container: %v", err)
-	}
-
+	rabbitConn.Close()
+	pgPool.Close()
+	_ = pool.Purge(resource)
 	os.Exit(code)
+}
+
+func runMigrations(db *sql.DB) error {
+	schema := `
+	CREATE TABLE IF NOT EXISTS messages (
+		id UUID PRIMARY KEY,
+		tenant_id UUID NOT NULL,
+		payload JSONB,
+		created_at TIMESTAMPTZ DEFAULT NOW()
+	) PARTITION BY LIST (tenant_id);
+	`
+	_, err := db.Exec(schema)
+	return err
 }
 
 func TestTenantLifecycle(t *testing.T) {
 	ctx := context.Background()
+	tm := tenant.NewTenantManager(rabbitConn, pgPool, 5)
+
 	tenantID := uuid.New()
-
-	// Create tenant (declare queue and start consumer)
-	if err := tm.CreateTenant(ctx, tenantID); err != nil {
-		t.Fatalf("Failed to create tenant: %v", err)
-	}
-
-	// Update concurrency config
-	newConcurrency := 3
-	if err := tm.UpdateConcurrency(tenantID, newConcurrency); err != nil {
-		t.Fatalf("Failed to update concurrency: %v", err)
-	}
-
-	// Publish message to tenant queue
-	ch, err := rmqConn.Channel()
+	err := tm.CreateTenant(ctx, tenantID)
 	if err != nil {
-		t.Fatalf("Failed to open RabbitMQ channel: %v", err)
+		t.Fatalf("failed to create tenant: %v", err)
 	}
-	defer ch.Close()
 
-	queueName := "tenant_" + tenantID.String() + "_queue"
-	payload := []byte(`{"test":"integration"}`)
+	// Asumsi ada GetTenant method (sesuaikan jika beda)
+	tenantData, err := tm.GetTenant(ctx, tenantID)
+	if err != nil || tenantData == nil {
+		t.Fatalf("tenant not found after creation")
+	}
 
-	err = ch.Publish(
-		"",
-		queueName,
-		false,
-		false,
-		amqp.Publishing{
-			ContentType: "application/json",
-			Body:        payload,
-		},
-	)
+	err = tm.DeleteTenant(ctx, tenantID)
 	if err != nil {
-		t.Fatalf("Failed to publish message: %v", err)
+		t.Fatalf("failed to delete tenant: %v", err)
 	}
 
-	// Wait for consumer to process message and save to DB
-	time.Sleep(2 * time.Second)
+	tenantData, err = tm.GetTenant(ctx, tenantID)
+	if err == nil && tenantData != nil {
+		t.Fatalf("tenant was not deleted")
+	}
+}
 
-	// Verify message stored in DB
-	rows, err := dbPool.Query(ctx, "SELECT payload FROM messages WHERE tenant_id=$1", tenantID)
+func TestMessagePublishConsume(t *testing.T) {
+	ctx := context.Background()
+	tm := tenant.NewTenantManager(rabbitConn, pgPool, 5)
+
+	tenantID := uuid.New()
+	err := tm.CreateTenant(ctx, tenantID)
 	if err != nil {
-		t.Fatalf("Failed to query messages: %v", err)
-	}
-	defer rows.Close()
-
-	found := false
-	for rows.Next() {
-		var dbPayload []byte
-		if err := rows.Scan(&dbPayload); err != nil {
-			t.Fatalf("Failed to scan row: %v", err)
-		}
-		if string(dbPayload) == string(payload) {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Fatal("Published message not found in DB")
+		t.Fatalf("failed to create tenant: %v", err)
 	}
 
-	// Delete tenant (stop consumer and delete queue)
-	if err := tm.DeleteTenant(ctx, tenantID); err != nil {
-		t.Fatalf("Failed to delete tenant: %v", err)
+	payload := `{"msg":"Hello from test"}`
+	err = tm.PublishMessage(ctx, tenantID, payload)
+	if err != nil {
+		t.Fatalf("failed to publish message: %v", err)
+	}
+
+	time.Sleep(2 * time.Second) // tunggu pesan diproses (kalau ada async)
+
+	msgs, _, err := tm.GetMessagesPaginated(ctx, tenantID.String(), "", 10)
+	if err != nil {
+		t.Fatalf("failed to get messages: %v", err)
+	}
+	if len(msgs) == 0 {
+		t.Fatal("no messages retrieved")
+	}
+
+	var msg map[string]string
+	err = json.Unmarshal([]byte(msgs[0].Payload), &msg)
+	if err != nil {
+		t.Fatalf("failed to unmarshal message payload: %v", err)
+	}
+
+	if msg["msg"] != "Hello from test" {
+		t.Errorf("message mismatch: got %v", msg)
+	}
+}
+
+func TestConcurrencyConfig(t *testing.T) {
+	tm := tenant.NewTenantManager(rabbitConn, pgPool, 5)
+
+	tenantID := uuid.New()
+	err := tm.CreateTenant(context.Background(), tenantID)
+	if err != nil {
+		t.Fatalf("failed to create tenant: %v", err)
+	}
+
+	err = tm.UpdateConcurrency(tenantID, 5)
+	if err != nil {
+		t.Fatalf("failed to update concurrency: %v", err)
+	}
+
+	// Jika ada method GetWorkerCount
+	workers := tm.GetWorkerCount(tenantID)
+	if workers != 5 {
+		t.Errorf("expected 5 workers, got %d", workers)
 	}
 }

@@ -6,7 +6,6 @@ import (
 	"github.com/google/uuid"
 )
 
-// Message merepresentasikan pesan yang terkait dengan tenant tertentu
 type Message struct {
     ID        uuid.UUID       `json:"id"`
     TenantID  uuid.UUID       `json:"tenant_id"`

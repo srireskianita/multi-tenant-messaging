@@ -135,35 +135,3 @@ func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(data)
 }
-
-// func (h *TenantHandler) ListMessages(w http.ResponseWriter, r *http.Request) {
-//     vars := mux.Vars(r)
-//     tenantID := vars["id"]
-
-//     cursor := r.URL.Query().Get("cursor")
-//     limitStr := r.URL.Query().Get("limit")
-//     limit := 10 // default
-
-//     if limitStr != "" {
-//         if l, err := strconv.Atoi(limitStr); err == nil && l > 0 {
-//             limit = l
-//         }
-//     }
-
-//     messages, nextCursor, err := h.Manager.GetMessagesPaginated(r.Context(), tenantID, cursor, limit)
-//     if err != nil {
-//         http.Error(w, "failed to get messages: "+err.Error(), http.StatusInternalServerError)
-//         return
-//     }
-
-//     resp := struct {
-//         Messages   []tenant.Message `json:"messages"`
-//         NextCursor string           `json:"next_cursor,omitempty"`
-//     }{
-//         Messages:   messages,
-//         NextCursor: nextCursor,
-//     }
-
-//     w.Header().Set("Content-Type", "application/json")
-//     json.NewEncoder(w).Encode(resp)
-// }
