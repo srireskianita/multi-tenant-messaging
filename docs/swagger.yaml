@@ -1,0 +1,178 @@
+basePath: /api/v1
+definitions:
+  api.ConcurrencyRequest:
+    properties:
+      workers:
+        type: integer
+    type: object
+  api.MessageResponse:
+    properties:
+      message:
+        type: string
+    type: object
+  api.TenantRequest:
+    properties:
+      id:
+        description: tenant id from client
+        type: string
+    type: object
+  tenant.Message:
+    properties:
+      created_at:
+        type: string
+      id:
+        type: string
+      payload:
+        type: object
+      tenant_id:
+        type: string
+    type: object
+  tenant.MessageListResponse:
+    properties:
+      data:
+        items:
+          $ref: '#/definitions/tenant.Message'
+        type: array
+      next_cursor:
+        type: string
+    type: object
+host: localhost:8080
+info:
+  contact: {}
+  description: API untuk pengelolaan tenant messaging
+  title: Multi-Tenant Messaging API
+  version: "1.0"
+paths:
+  /tenants:
+    post:
+      consumes:
+      - application/json
+      description: Membuat tenant baru dan memulai konsumer
+      parameters:
+      - description: Tenant info
+        in: body
+        name: tenant
+        required: true
+        schema:
+          $ref: '#/definitions/api.TenantRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/api.MessageResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.MessageResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.MessageResponse'
+      summary: Create new tenant
+      tags:
+      - tenants
+  /tenants/{id}:
+    delete:
+      description: Menghapus tenant dan menghentikan konsumer
+      parameters:
+      - description: Tenant UUID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.MessageResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.MessageResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.MessageResponse'
+      summary: Delete tenant
+      tags:
+      - tenants
+  /tenants/{id}/config/concurrency:
+    put:
+      consumes:
+      - application/json
+      description: Update jumlah worker konsumer untuk tenant
+      parameters:
+      - description: Tenant UUID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Concurrency config
+        in: body
+        name: concurrency
+        required: true
+        schema:
+          $ref: '#/definitions/api.ConcurrencyRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.MessageResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.MessageResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.MessageResponse'
+      summary: Update concurrency config
+      tags:
+      - tenants
+  /tenants/{tenant_id}/messages:
+    get:
+      description: Mendapatkan daftar pesan tenant dengan cursor pagination
+      parameters:
+      - description: Tenant UUID
+        in: path
+        name: tenant_id
+        required: true
+        type: string
+      - description: Cursor for pagination (message ID)
+        in: query
+        name: cursor
+        type: string
+      - default: 10
+        description: Limit number of messages to return
+        in: query
+        name: limit
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/tenant.MessageListResponse'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "500":
+          description: Internal Server Error
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: List messages with pagination
+      tags:
+      - messages
+swagger: "2.0"
